@@ -68,9 +68,9 @@ register_account() {
         "${BIN}" account 2>&1 | head -5 || true
         return 0
     fi
-    info "Registering new WARP account..."
+    info "Registering new WARP account (auto-accepting TOS)..."
     cd "${INSTALL_DIR}"
-    "${BIN}" register
+    echo "y" | "${BIN}" register
     [[ -f "${INSTALL_DIR}/config.json" ]] || fail "Registration failed — no config.json"
     mv "${INSTALL_DIR}/config.json" "${CONFIG}" 2>/dev/null || true
     info "Account registered ✓"
