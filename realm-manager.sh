@@ -16,10 +16,12 @@
 #
 #   ./realm-manager.sh                        # 交互菜单
 #   ./realm-manager.sh install [版本]         # 安装 / 升级 realm 二进制
-#   ./realm-manager.sh add <监听> <目标> [备注] [--multi t2,t3] [--balance rr|iphash]
+#   ./realm-manager.sh add <端口|监听地址> <目标> [备注] [--multi t2,t3] [--balance rr|iphash]
+#                    只写端口号 = 双栈监听 [::]:端口（默认）
 #   ./realm-manager.sh list                   # 规则表（含备注与实时连接数）
 #   ./realm-manager.sh note <序号> <新备注>   # 改备注
 #   ./realm-manager.sh retarget <序号> <新目标>
+#   ./realm-manager.sh relisten <序号> <端口|新监听>
 #   ./realm-manager.sh del <序号>
 #   ./realm-manager.sh status|start|stop|restart
 #   ./realm-manager.sh backup | restore [备份文件]
@@ -254,6 +256,7 @@ do_install() {
 }
 
 write_config_if_missing() {
+    mkdir -p "$REALM_DIR" || fail "无法创建目录 $REALM_DIR"
     [[ -f "$CONFIG_FILE" ]] && return 0
     cat > "$CONFIG_FILE" <<'EOF'
 [network]
@@ -337,6 +340,11 @@ validate_addr() {
     return 0
 }
 
+# 只给端口号 → 展开成双栈监听 [::]:端口（ipv6_only=false 时同时收 IPv4/IPv6）
+expand_listen() {
+    if [[ "$1" =~ ^[0-9]+$ ]]; then echo "[::]:$1"; else echo "$1"; fi
+}
+
 listen_in_use_by_other() {
     [[ -n "$(ss -Htln "sport = :${1##*:}" 2>/dev/null)" ]]
 }
@@ -376,7 +384,14 @@ add_rule() {  # $1=listen $2=remote $3=备注 $4=extra_remotes $5=balance
             echo "extra_remotes = [${arr%, }]"
         fi
         [[ -n "$balance" ]] && echo "balance = \"$balance\""
-    } >> "$CONFIG_FILE"
+    } >> "$CONFIG_FILE" 2>/dev/null
+
+    # 回读校验：写进去了才算成功（目录不存在/权限不足时不再假报成功）
+    if ! rules_tsv | awk -F'\037' -v l="$listen" '$3==l {f=1} END{exit !f}'; then
+        warn "规则没写进 $CONFIG_FILE（目录不可写？）"
+        head -n "$before" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fail "添加失败（已回滚）"
+    fi
 
     if restart_and_check; then
         info "已添加：$listen → $remote${extra:+ , $extra}　备注「$note」"
@@ -449,8 +464,15 @@ edit_rule() {  # $1=序号 $2=note|remote|listen $3=新值
 }
 
 # ── 服务 / 备份 / 定时 / 卸载 ─────────────────────────────────────────────────
+svc_installed() { [[ -x "${REALM_DIR}/realm" && -f "$SERVICE_FILE" ]]; }
+
 restart_and_check() {
     systemctl daemon-reload
+    # 还没装 realm 时不该报失败：规则先写进配置，装完再起服务
+    if ! svc_installed; then
+        warn "realm 尚未安装（缺 ${REALM_DIR}/realm 或 ${SERVICE_FILE}）—— 配置已保存，install 之后会自动生效"
+        return 0
+    fi
     # realm 要求至少有一条 endpoint，否则直接 panic（配合 Restart=always 会变成 crash-loop）
     if [[ -z "$(rules_tsv)" ]]; then
         warn "配置里没有任何规则 —— realm 至少要有 1 条 endpoint 才能启动，服务保持停止"
@@ -531,7 +553,9 @@ do_uninstall() {
 # ── 交互菜单 ──────────────────────────────────────────────────────────────────
 menu_add() {
     echo
-    read -rp "监听地址（如 0.0.0.0:8443）: " listen;  [[ -z "$listen" ]] && return
+    read -rp "监听端口（只填端口号，默认双栈监听 [::]:端口；也可填完整地址如 0.0.0.0:8443）: " lp
+    [[ -z "$lp" ]] && return
+    local listen; listen=$(expand_listen "$lp")
     read -rp "目标地址（如 1.2.3.4:443）: "   remote;  [[ -z "$remote" ]] && return
     read -rp "备注（回车跳过）: "             note
     read -rp "备用目标（逗号分隔，回车跳过）: " extra
@@ -604,7 +628,7 @@ menu() {
                case "$k" in
                    1) print_rules; read -rp "序号: " i; read -rp "新备注: " t; edit_rule "$i" note "$t" ;;
                    2) print_rules; read -rp "序号: " i; read -rp "新目标: " t; edit_rule "$i" remote "$t" ;;
-                   3) print_rules; read -rp "序号: " i; read -rp "新监听: " t; edit_rule "$i" listen "$t" ;;
+                   3) print_rules; read -rp "序号: " i; read -rp "新监听（端口号=双栈 [::]:端口）: " t; edit_rule "$i" listen "$(expand_listen "$t")" ;;
                esac ;;
             5) menu_delete ;;
             6) menu_service ;;
@@ -627,8 +651,8 @@ cmd="${1:-menu}"; shift || true
 case "$cmd" in
     install)  do_install "${1:-}" ;;
     add)
-        [[ $# -ge 2 ]] || fail "用法: add <监听> <目标> [备注] [--multi t2,t3] [--balance rr|iphash]"
-        listen="$1"; remote="$2"
+        [[ $# -ge 2 ]] || fail "用法: add <端口|监听地址> <目标> [备注] [--multi t2,t3] [--balance rr|iphash]"
+        listen=$(expand_listen "$1"); remote="$2"
         if [[ $# -ge 3 ]]; then note="$3"; shift 3; else note=""; shift $#; fi
         extra=""; bal=""
         while [[ $# -gt 0 ]]; do
@@ -653,7 +677,7 @@ case "$cmd" in
     dump)     printf '%s\n' "$(rules_tsv)" | cat -A ;;   # 诊断用：看原始 TSV 字段
     note)     [[ $# -ge 2 ]] || fail "用法: note <序号> <新备注>"; edit_rule "$1" note "$2" ;;
     retarget) [[ $# -ge 2 ]] || fail "用法: retarget <序号> <新目标>"; edit_rule "$1" remote "$2" ;;
-    relisten) [[ $# -ge 2 ]] || fail "用法: relisten <序号> <新监听>"; edit_rule "$1" listen "$2" ;;
+    relisten) [[ $# -ge 2 ]] || fail "用法: relisten <序号> <端口|新监听>"; edit_rule "$1" listen "$(expand_listen "$2")" ;;
     del|rm)   [[ $# -ge 1 ]] || fail "用法: del <序号>"; del_rule "$1" ;;
     start)    need_root; systemctl enable --now realm && info "已启动" ;;
     stop)     need_root; systemctl stop realm && info "已停止" ;;
