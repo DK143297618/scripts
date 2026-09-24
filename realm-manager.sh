@@ -6,7 +6,8 @@
 # 特性
 #   · 备注是一等公民：添加时写、列表里显示、可随时改、删除前按备注确认
 #   · 二进制走自建代理 https://docker.mmzs.space（REALM_MIRROR 可覆盖）
-#   · musl 静态版，不依赖 glibc；下载后按 GitHub 官方 digest 校验 sha256
+#   · 优先 glibc 动态版；本机 glibc 太旧跑不起来时自动回退 glibc2.28 → musl 静态版
+#   · 下载后按 GitHub 官方 digest 校验 sha256（对不上直接拒绝安装）
 #   · 没有自动更新、不拉取任何第三方脚本、不误删 /etc 下无关文件
 #
 # 用法
@@ -29,6 +30,8 @@
 #   REALM_MIRROR   默认 https://docker.mmzs.space；填 direct 走 GitHub 直连
 #   REALM_VARIANT  默认 full（含 proxy/balance/transport）；slim 体积小但缺这三项
 #   REALM_VERSION  默认取最新；可固定，如 REALM_VERSION=2.9.6
+#   REALM_LIBC     默认 auto：优先 glibc，跑不起来自动回退 glibc2.28 → musl
+#                  也可强制只用一个：glibc | glibc2.28 | musl
 #
 # 实测：Debian 12 arm64 / realm 2.9.6 musl —— 安装、转发（HTTP 200）、备注增改删
 # ══════════════════════════════════════════════════════════════════════════════
@@ -41,16 +44,25 @@ LOG_FILE="/var/log/realm-manager.log"
 CRON_TAG="realm-manager"
 MIRROR="${REALM_MIRROR:-https://docker.mmzs.space}"
 VARIANT="${REALM_VARIANT:-full}"
+LIBC="${REALM_LIBC:-auto}"
 PINNED_VERSION="${REALM_VERSION:-}"
 GH_REPO="zhboner/realm"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 
-# v2.9.6 官方 sha256（GitHub API digest 取不到时的兜底）
+# v2.9.6 官方 sha256，按资产名索引（GitHub API digest 取不到时的兜底）
 declare -A FALLBACK_SHA=(
-    ["full:x86_64"]="b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65"
-    ["full:aarch64"]="f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488"
-    ["slim:x86_64"]="d5b7e8aee1b5c78486e0fc88d536f190bac8525c53bb61a65c2b583f0a84e6e8"
-    ["slim:aarch64"]="cbe7da020de778d1d55faba037d8bdae48e386ed210c24cd461a4b7c05a44bba"
+    ["realm-x86_64-unknown-linux-gnu.tar.gz"]="b9efc8ccbab5c9f0602ab5ba0a2e00311e7b773944533a8373c00811fb6a1a6b"
+    ["realm-aarch64-unknown-linux-gnu.tar.gz"]="4b6c059df67a3161369df3133e5ea9e4bd266185c634ccc8990cd5bb8d271786"
+    ["realm-x86_64-unknown-linux-gnu-glibc2.28.tar.gz"]="a85652b940fa23bf08fd29582e33e87ea9c940a71bcc7d21df9c0bd03f351149"
+    ["realm-aarch64-unknown-linux-gnu-glibc2.28.tar.gz"]="0e277d58df7a9ee9eaca1277223b54b29b1af27a1fad04ae83c7b938d451c5f8"
+    ["realm-x86_64-unknown-linux-musl.tar.gz"]="b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65"
+    ["realm-aarch64-unknown-linux-musl.tar.gz"]="f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488"
+    ["realm-slim-x86_64-unknown-linux-gnu.tar.gz"]="841b907248a60779142a097b6a3e5e74cea4c4ce628f2af5c2effe06530408a8"
+    ["realm-slim-aarch64-unknown-linux-gnu.tar.gz"]="4bd8017168b13dfa7347f35ba8b1dad876a81b462cf01529fc7d4203d0ab4099"
+    ["realm-slim-x86_64-unknown-linux-gnu-glibc2.28.tar.gz"]="3cc1b615e407066c083105b82ca943e25a724a4b89792e3c94cdce9e88541642"
+    ["realm-slim-aarch64-unknown-linux-gnu-glibc2.28.tar.gz"]="5f47aef4214f994805ab2ccba9d1179d0506d7093e453ef27ef1c9aa881557b2"
+    ["realm-slim-x86_64-unknown-linux-musl.tar.gz"]="d5b7e8aee1b5c78486e0fc88d536f190bac8525c53bb61a65c2b583f0a84e6e8"
+    ["realm-slim-aarch64-unknown-linux-musl.tar.gz"]="cbe7da020de778d1d55faba037d8bdae48e386ed210c24cd461a4b7c05a44bba"
 )
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -97,10 +109,29 @@ host_arch() {
     esac
 }
 
-asset_name() {
-    local arch; arch=$(host_arch) || return 1
-    if [[ "$VARIANT" == "slim" ]]; then echo "realm-slim-${arch}-unknown-linux-musl.tar.gz"
-    else echo "realm-${arch}-unknown-linux-musl.tar.gz"; fi
+libc_suffix() {
+    case "$1" in
+        glibc)     echo "gnu" ;;
+        glibc2.28) echo "gnu-glibc2.28" ;;
+        musl)      echo "musl" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 候选顺序：优先 glibc（动态），跑不起来再退 glibc2.28（老 glibc 系统），最后 musl（静态兜底）
+libc_chain() {
+    case "${LIBC:-auto}" in
+        glibc|glibc2.28|musl) printf '%s\n' "$LIBC" ;;
+        *)                    printf '%s\n' glibc glibc2.28 musl ;;
+    esac
+}
+
+asset_name() {  # $1=libc 标签
+    local arch suffix
+    arch=$(host_arch) || return 1
+    suffix=$(libc_suffix "$1") || return 1
+    if [[ "$VARIANT" == "slim" ]]; then echo "realm-slim-${arch}-unknown-linux-${suffix}.tar.gz"
+    else echo "realm-${arch}-unknown-linux-${suffix}.tar.gz"; fi
 }
 
 latest_version() {
@@ -128,9 +159,45 @@ api_digest() {  # $1=版本 $2=资产名 → hex（无 python3 依赖）
         }'
 }
 
+# 下载 + 校验 + 落地一个候选二进制（不碰服务）
+fetch_binary() {  # $1=版本 $2=libc 标签
+    local ver="$1" libc="$2" asset dl tmp expect got bin
+    asset=$(asset_name "$libc") || { warn "无法确定资产名（$libc）"; return 1; }
+    tmp=$(mktemp -d) || { warn "创建临时目录失败"; return 1; }
+    dl="$(url_dl "${GH_REPO}/releases/download/v${ver}/${asset}")"
+    info "下载 $asset"
+    if ! curl -fsSL --connect-timeout 20 --retry 2 -o "$tmp/$asset" "$dl"; then
+        warn "下载失败（该版本可能没有 $asset）"; rm -rf "$tmp"; return 1
+    fi
+
+    expect=$(api_digest "$ver" "$asset" | sed 's/^sha256://')
+    if [[ -z "$expect" ]]; then
+        expect="${FALLBACK_SHA["$asset"]:-}"
+        [[ -n "$expect" ]] && warn "取不到 API digest，改用内置校验值"
+    fi
+    got=$(sha256sum "$tmp/$asset" | awk '{print $1}')
+    if [[ -n "$expect" ]]; then
+        if [[ "$got" != "$expect" ]]; then
+            warn "sha256 校验失败（期望 ${expect:0:16}… 实际 ${got:0:16}…）"; rm -rf "$tmp"; return 1
+        fi
+        info "sha256 校验通过 ${got:0:16}…"
+    else
+        warn "无可用校验值，跳过 sha256（实际 ${got:0:16}…）"
+    fi
+
+    tar -xzf "$tmp/$asset" -C "$tmp" || { warn "解压失败"; rm -rf "$tmp"; return 1; }
+    bin=$(find "$tmp" -maxdepth 2 -type f -name 'realm*' ! -name '*.tar.gz' | head -1)
+    [[ -n "$bin" ]] || { warn "压缩包里没有 realm 二进制"; rm -rf "$tmp"; return 1; }
+    mkdir -p "$REALM_DIR"
+    [[ -f "${REALM_DIR}/realm" ]] && cp -f "${REALM_DIR}/realm" "${REALM_DIR}/realm.prev"
+    install -m 0755 "$bin" "${REALM_DIR}/realm" || { warn "写入二进制失败"; rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    return 0
+}
+
 do_install() {
     need_root; check_deps
-    local ver="$1" arch asset dl tmp expect got bin before
+    local ver="$1" arch libc verr ok=0
     arch=$(host_arch) || fail "不支持的架构：$(uname -m)（仅 x86_64 / aarch64）"
 
     if [[ -z "$ver" ]]; then
@@ -142,58 +209,48 @@ do_install() {
             ver="${ver:-2.9.6}"
         fi
     fi
-    asset=$(asset_name "$ver") || fail "无法确定资产名"
 
-    title "安装 Realm ${ver}（${VARIANT} · musl · ${arch}）"
-    mkdir -p "$REALM_DIR"
-    tmp=$(mktemp -d) || fail "创建临时目录失败"
+    local tried=()
+    for libc in $(libc_chain); do
+        title "安装 Realm ${ver}（${VARIANT} · ${libc} · ${arch}）"
+        tried+=("$libc")
+        fetch_binary "$ver" "$libc" || { warn "${libc} 版没拿到，试下一个"; continue; }
 
-    dl="$(url_dl "${GH_REPO}/releases/download/v${ver}/${asset}")"
-    info "下载：$dl"
-    if ! curl -fsSL --connect-timeout 20 --retry 2 -o "$tmp/$asset" "$dl"; then
-        rm -rf "$tmp"; fail "下载失败 —— 检查网络 / 镜像 REALM_MIRROR=$MIRROR / 版本 v${ver} 是否有该资产"
-    fi
+        # 二进制自检：glibc 太旧会在这里暴露（version `GLIBC_x.xx' not found）
+        if ! verr=$("${REALM_DIR}/realm" --version 2>&1); then
+            warn "${libc} 版在本机跑不起来：${verr##*$'\n'}"
+            [[ "$libc" != "musl" ]] && warn "本机 glibc：$(ldd --version 2>/dev/null | head -1)"
+            warn "继续尝试下一个候选"
+            continue
+        fi
+        info "二进制可用：$verr"
 
-    expect=$(api_digest "$ver" "$asset" | sed 's/^sha256://')
-    if [[ -z "$expect" ]]; then
-        expect="${FALLBACK_SHA["${VARIANT}:${arch}"]:-}"
-        [[ -n "$expect" ]] && warn "取不到 API digest，改用内置校验值"
-    fi
-    got=$(sha256sum "$tmp/$asset" | awk '{print $1}')
-    if [[ -n "$expect" ]]; then
-        [[ "$got" == "$expect" ]] || { rm -rf "$tmp"; fail "sha256 校验失败！期望 ${expect:0:16}… 实际 ${got:0:16}…（镜像可能返回了错误内容）"; }
-        info "sha256 校验通过 ${got:0:16}…"
-    else
-        warn "无可用校验值，跳过 sha256（实际 ${got:0:16}…）"
-    fi
+        write_config_if_missing
+        write_service
+        systemctl daemon-reload
+        systemctl enable realm >/dev/null 2>&1 || true
+        printf '%s\n' "$libc" > "${REALM_DIR}/.libc"
 
-    tar -xzf "$tmp/$asset" -C "$tmp" || { rm -rf "$tmp"; fail "解压失败"; }
-    bin=$(find "$tmp" -maxdepth 2 -type f -name 'realm*' ! -name '*.tar.gz' | head -1)
-    [[ -n "$bin" ]] || { rm -rf "$tmp"; fail "压缩包里找不到 realm 二进制"; }
-    [[ -f "${REALM_DIR}/realm" ]] && cp -f "${REALM_DIR}/realm" "${REALM_DIR}/realm.prev"
-    install -m 0755 "$bin" "${REALM_DIR}/realm" || { rm -rf "$tmp"; fail "写入二进制失败"; }
-    rm -rf "$tmp"
+        if [[ -z "$(rules_tsv)" ]]; then
+            info "安装完成（${libc}）"
+            warn "还没有任何规则 —— realm 需要至少 1 条 endpoint 才能启动，先 add 一条规则即可自动起服务"
+            log "install $ver $VARIANT $libc $arch (no rules yet)"
+            ok=1; break
+        fi
+        if restart_and_check; then
+            info "安装完成（${libc}）：$verr"
+            log "install $ver $VARIANT $libc $arch"
+            ok=1; break
+        fi
+        warn "${libc} 版服务起不来，试下一个候选"
+    done
 
-    write_config_if_missing
-    write_service
-    systemctl daemon-reload
-    systemctl enable realm >/dev/null 2>&1 || true
-    if [[ -z "$(rules_tsv)" ]]; then
-        info "安装完成：$("${REALM_DIR}/realm" --version 2>/dev/null | head -1)"
-        warn "还没有任何规则 —— realm 需要至少 1 条 endpoint 才能启动，先 add 一条规则即可自动起服务"
-        log "install $ver $VARIANT $arch (no rules yet)"
-        return 0
+    (( ok )) && return 0
+    err "候选全失败：${tried[*]}"
+    if [[ -f "${REALM_DIR}/realm.prev" ]]; then
+        cp -f "${REALM_DIR}/realm.prev" "${REALM_DIR}/realm"; warn "已回滚到上一个可用二进制"
     fi
-    systemctl restart realm
-    sleep 0.6
-    if systemctl is-active --quiet realm; then
-        info "安装完成：$("${REALM_DIR}/realm" --version 2>/dev/null | head -1)"
-        log "install $ver $VARIANT $arch"
-    else
-        err "服务未启动，日志："
-        journalctl -u realm -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
-        return 1
-    fi
+    return 1
 }
 
 write_config_if_missing() {
@@ -409,11 +466,12 @@ restart_and_check() {
 }
 
 svc_status() {
-    local state bin
+    local state bin libc
     state=$(systemctl is-active realm 2>/dev/null || true); state=${state:-unknown}
+    libc=$(cat "${REALM_DIR}/.libc" 2>/dev/null || true)
     if [[ -x "${REALM_DIR}/realm" ]]; then bin=$("${REALM_DIR}/realm" --version 2>/dev/null | head -1); else bin="未安装"; fi
     echo "  服务：${state}    自启：$(systemctl is-enabled realm 2>/dev/null || echo -)    规则：$(rules_tsv | wc -l | tr -d ' ') 条"
-    echo "  版本：${bin}"
+    echo "  版本：${bin}${libc:+　[${libc}]}"
     echo "  配置：${CONFIG_FILE}"
 }
 
@@ -562,7 +620,7 @@ menu() {
     done
 }
 
-usage() { sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>2 { if ($0 ~ /^set -uo/) exit; if ($0 ~ /^#/) { sub(/^# ?/, ""); print } }' "$0"; }
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 cmd="${1:-menu}"; shift || true
