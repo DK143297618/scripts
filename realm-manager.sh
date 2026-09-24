@@ -49,7 +49,7 @@ VARIANT="${REALM_VARIANT:-full}"
 LIBC="${REALM_LIBC:-auto}"
 PINNED_VERSION="${REALM_VERSION:-}"
 GH_REPO="zhboner/realm"
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 
 # v2.9.6 官方 sha256，按资产名索引（GitHub API digest 取不到时的兜底）
 declare -A FALLBACK_SHA=(
